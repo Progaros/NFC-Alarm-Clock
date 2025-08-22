@@ -35,26 +35,17 @@ object NacScheduler
 			return
 		}
 
-		// FIXED: Handle skipped alarms properly for Android system integration
-		// Get the calendar for internal alarm scheduling (ignores skip for proper internal handling)
-		val internalAlarmCal = NacCalendar.getNextAlarmDay(alarm, ignoreSkip = true)!!
+		// Get the calendar for when the alarm should actually fire
+		val alarmCal = NacCalendar.getNextAlarmDay(alarm, ignoreSkip = true)!!
 
-		// Get the calendar for what Android should report as "next alarm" (respects skip flag)
-		val systemAlarmCal = NacCalendar.getNextAlarmDay(alarm, ignoreSkip = false)!!
-
-		// Debug logging
-		println("Internal alarm time: ${getDateTimeInstance().format(internalAlarmCal.time)}")
-		println("System reported alarm time: ${getDateTimeInstance().format(systemAlarmCal.time)}")
-		println("Should skip next alarm: ${alarm.shouldSkipNextAlarm}")
-
-		// Add the alarm with correct system integration
-		addAlarm(context, alarm, internalAlarmCal, systemAlarmCal)
+		// Add the alarm to the scheduler
+		addAlarm(context, alarm, alarmCal)
 
 		// Check if should show an upcoming reminder
 		if (alarm.shouldShowReminder && !alarm.shouldSkipNextAlarm)
 		{
 			// Get the calendar for the first upcoming reminder
-			val firstReminderCal = NacCalendar.getFirstAlarmUpcomingReminder(alarm, internalAlarmCal)
+			val firstReminderCal = NacCalendar.getFirstAlarmUpcomingReminder(alarm, alarmCal)
 
 			// Add the upcoming reminder
 			addUpcomingReminder(context, alarm, firstReminderCal)
@@ -63,76 +54,36 @@ object NacScheduler
 
 	/**
 	 * Add an alarm to the scheduler.
-	 * 
-	 * @param context Context
-	 * @param alarm The alarm to schedule
-	 * @param internalCal When the alarm should actually fire (internal scheduling)
-	 * @param systemCal When Android should report as next alarm (system integration)
-	 */
-	private fun addAlarm(
-		context: Context,
-		alarm: NacAlarm,
-		internalCal: Calendar,
-		systemCal: Calendar)
-	{
-		// Operation to perform when the alarm goes off
-		val pendingIntent = buildAddAlarmPendingIntent(context, alarm)
-
-		// Add to the alarm manager with proper system integration
-		addToAlarmManager(context, internalCal, systemCal, pendingIntent)
-	}
-
-	/**
-	 * Add an alarm to the scheduler (backward compatibility).
 	 */
 	private fun addAlarm(
 		context: Context,
 		alarm: NacAlarm,
 		cal: Calendar)
 	{
-		// Fallback to original behavior for backward compatibility
-		addAlarm(context, alarm, cal, cal)
+		// Operation to perform when the alarm goes off
+		val pendingIntent = buildAddAlarmPendingIntent(context, alarm)
+
+		// Add to the alarm manager
+		addToAlarmManager(context, cal, pendingIntent)
 	}
 
 	/**
 	 * Add an alarm calendar to the scheduler.
-	 * 
-	 * @param context Context
-	 * @param internalCal When the alarm should actually fire
-	 * @param systemCal When Android should report as next alarm
-	 * @param operationPendingIntent Operation to perform when alarm fires
-	 */
-	private fun addToAlarmManager(
-		context: Context,
-		internalCal: Calendar,
-		systemCal: Calendar,
-		operationPendingIntent: PendingIntent)
-	{
-		// Time that Android should report as "next alarm" (fixes the issue!)
-		val systemMillis = systemCal.timeInMillis
-
-		// Show the main activity
-		val showPendingIntent = buildMainActivityPendingIntent(context)
-
-		// FIXED: Use systemCal time for AlarmClockInfo so Android reports correct next alarm
-		val clockInfo = AlarmClockInfo(systemMillis, showPendingIntent)
-		val manager = getAlarmManager(context)
-
-		// Set the alarm - this tells Android when to show as "next alarm"
-		// The operation will still fire at the correct time due to internal scheduling
-		manager.setAlarmClock(clockInfo, operationPendingIntent)
-	}
-
-	/**
-	 * Add an alarm calendar to the scheduler (backward compatibility).
 	 */
 	private fun addToAlarmManager(
 		context: Context,
 		cal: Calendar,
 		operationPendingIntent: PendingIntent)
 	{
-		// Fallback to original behavior
-		addToAlarmManager(context, cal, cal, operationPendingIntent)
+		// Show the main activity
+		val showPendingIntent = buildMainActivityPendingIntent(context)
+
+		// Create the alarm clock info and set the alarm
+		val clockInfo = AlarmClockInfo(cal.timeInMillis, showPendingIntent)
+		val manager = getAlarmManager(context)
+
+		// Set the alarm
+		manager.setAlarmClock(clockInfo, operationPendingIntent)
 	}
 
 	/**
@@ -427,11 +378,29 @@ object NacScheduler
 	}
 
 	/**
+	 * Add a skipped alarm internally for skip flag clearing without reporting to Android.
+	 * This uses the regular alarm manager but not setAlarmClock, so Android won't report
+	 * this as the "next alarm".
+	 */
+	private fun addSkippedAlarmInternally(context: Context, alarm: NacAlarm)
+	{
+		// Get the calendar for when the alarm should fire (ignoring skip for scheduling)
+		val alarmCal = NacCalendar.getNextAlarmDay(alarm, ignoreSkip = true)!!
+
+		// Operation to perform when the alarm goes off (will clear skip flag)
+		val pendingIntent = buildAddAlarmPendingIntent(context, alarm)
+
+		// Use regular setExact instead of setAlarmClock to avoid Android reporting
+		val manager = getAlarmManager(context)
+		manager.setExact(AlarmManager.RTC_WAKEUP, alarmCal.timeInMillis, pendingIntent)
+	}
+
+	/**
 	 * Refresh all alarms.
 	 */
 	fun refreshAll(context: Context, alarms: List<NacAlarm>)
 	{
-		// Iterate over each alarm
+		// First, cancel all existing alarms
 		for (a in alarms)
 		{
 			val id = a.id.toInt()
@@ -444,9 +413,35 @@ object NacScheduler
 
 			// Clear out any new alarms, just in case
 			cancel(context, a)
+		}
 
-			// Add each alarm
-			add(context, a)
+		// Determine which alarm should be reported to Android as the "next alarm"
+		// This should be the actual next alarm that will ring (not skipped)
+		val nextAlarmToReport = NacCalendar.getNextAlarm(alarms)
+
+		// Schedule all enabled alarms, but use smart Android reporting
+		for (a in alarms)
+		{
+			// Skip disabled alarms
+			if (!a.isEnabled)
+			{
+				continue
+			}
+
+			// For skipped alarms that are not the "next alarm to report", 
+			// we need to schedule them internally to clear the skip flag,
+			// but not report them to Android as the next alarm
+			if (a.shouldSkipNextAlarm && a != nextAlarmToReport)
+			{
+				// Schedule this alarm internally for skip flag clearing
+				// but don't use setAlarmClock (which reports to Android)
+				addSkippedAlarmInternally(context, a)
+			}
+			else
+			{
+				// Schedule normally (this will report to Android if it's the next alarm)
+				add(context, a)
+			}
 		}
 	}
 
@@ -479,12 +474,8 @@ object NacScheduler
 	 */
 	fun updateAll(context: Context, alarms: List<NacAlarm>)
 	{
-		// Iterate over each alarm
-		for (a in alarms)
-		{
-			// Update the alarm
-			update(context, a)
-		}
+		// Use refreshAll for consistent behavior with smart Android reporting
+		refreshAll(context, alarms)
 	}
 
 }
